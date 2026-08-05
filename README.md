@@ -108,11 +108,59 @@
 
 ---
 
+## 本 Fork 的改动
+
+上游测试环境为超级小爱 **7.513.23.0010**；本 Fork 在 **7.12.2.0318**（Redmi K80 / Android 16 / HyperOS 2）上逆向适配并实测通过（模型替换、工具注入均验证）。
+
+### 1. 适配设备版混淆类名
+
+两代小爱的混淆类名/方法名完全不同（同名短类甚至语义不同，如 `z10.a` 上游是 ASR 处理器、设备版是媒体类）。已逆向定位设备版对应类：
+
+| Hook 点 | 上游 7.513.23.0010 | 本机 7.12.2.0318 |
+| --- | --- | --- |
+| ASR 处理器 | `z10.a` / `processed` | `g10.d` / `filterInstruction` |
+| RN 桥 | `r70.a` | `yp0.a` |
+| Agent 动作 | `kh0.s0` | `dh0.s0` |
+| ToastStreamPlayer | `la0.n1` | `ea0.n1` |
+| 音轨管理 | `v20.e` | `o20.e` |
+| Toast 卡片 | `jb0.vd` | `instruction.base.b` |
+| UI 导航 | `jb0.ue` | `cb0.qe` |
+
+### 2. 多候选类名 + 运行时特征探测（防大版本失效）
+
+- 每个 hook 点的类名改为**候选数组**（`resolveClass` 逐个尝试），新版本适配只需往数组追加类名。
+- 候选全部失败时，`ClassProbe` 自动扫描小爱 APK 的 dex，按**字符串锚点**（`ToastStreamPlayer` TAG、`SpeechRecognizer.RecognizeResult` 指令名等）、**未混淆方法名**（`sendStreamData`、`executeActionsAsync`）和 **Kotlin object 结构**定位类——这些锚点不随混淆变化，**大多数版本更新会自动适配，无需人工逆向**。
+
+### 3. 配置读取兜底
+
+直写 `SharedPreferences` 文件可能被进程内存缓存挡住（表现为 UI 显示「尚未填写 API Key」而配置文件完好）。`ConfigProvider` 增加了磁盘文件兜底解析（`readKeyFromPrefsFile`），hook 侧始终读到磁盘最新配置。
+
+### 4. OTA 一键修复
+
+`fix-after-ota.sh`：检测小爱版本变化 → 重装模块 APK（签名不匹配自动引导卸载重装）→ 恢复无障碍权限 → 重启小爱 → 验证 hook 活性。系统 OTA 后跑一次即可。
+
+### 5. 适配手册
+
+`ADAPTATION.md` 记录了完整的版本适配流程：特征锚点清单、dex 扫描/反编译定位方法、映射表更新方式、构建环境备忘。
+
+### 已知限制
+
+- **语音播报**：设备版 `ea0.n1` 无 `speakTts` 等价入口，接管后不播报 TTS（卡片文字正常显示）。
+- 小爱功能重构（锚点消失）时需按 `ADAPTATION.md` 人工适配一次。
+
+### 同步上游
+
+```bash
+git fetch origin && git merge origin/master
+```
+
+---
+
 ## 环境要求
 
 - Android 13+
-- HyperOS，超级小爱 `com.miui.voiceassist`(7.513.23.0010)
-- LSPosed（Xposed API 93+）
+- HyperOS，超级小爱 `com.miui.voiceassist`（本 Fork 实测 7.12.2.0318）
+- LSPosed / Vector（Xposed API 93+）
 - Root
 
 作用域勾选 `com.miui.voiceassist` 
