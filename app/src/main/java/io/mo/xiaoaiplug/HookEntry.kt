@@ -449,6 +449,12 @@ class HookEntry : IXposedHookLoadPackage {
     // 静音泵作用于哪个对话。新提问换了 dialogId 就停泵,免得把下一轮的正常播报也吃掉。
     @Volatile private var mutePumpDialogId = ""
 
+    /** Compose 卡流接收器实例(cb0/db):注入完成后调 t0() 关掉「停止生成」状态。 */
+    @Volatile private var composeCardStreamRef: WeakReference<Any>? = null
+
+    /** 本次接管会话是否已放过占位块(第一块替换成「正在思考…」,其余拦掉)。 */
+    private val placeholderShown = java.util.concurrent.atomic.AtomicBoolean(false)
+
     // 泵是否已在跑,避免重复投递形成多条自我递归的 Runnable 链
     @Volatile private var mutePumpRunning = false
 
@@ -480,6 +486,7 @@ class HookEntry : IXposedHookLoadPackage {
         hookCardSinks(lpparam.classLoader)
         hookAsrResult(lpparam.classLoader)
         hookAsrChannel(lpparam.classLoader)
+        hookComposeCardStream(lpparam.classLoader)
         hookAgentAction(lpparam.classLoader)
         hookToastCard(lpparam.classLoader)
         hookIntentLaunch(lpparam.classLoader)
@@ -570,6 +577,63 @@ class HookEntry : IXposedHookLoadPackage {
         } catch (t: Throwable) {
             Log.i(TAG, "hook asr fail: $t")
         }
+    }
+
+    // 设备版 Compose 卡内容入口:cb0/db.A0(Instruction)(TemplateFrontendPageOperation)
+    // 处理 ToastStream 指令并追加内容。小爱的回答内容走这条路径渲染进
+    // ResultOperationComposeCard,**不经过** RN 桥(yp0.a.sendStreamData),
+    // 所以 hookBridge 拦不到 —— 表现为「小爱回答显示在前、我们的答案追加在下方」。
+    // 接管期间(pump active)在这里拦掉小爱的 ToastStream 内容。
+    private fun hookComposeCardStream(cl: ClassLoader) {
+        val clazz = try {
+            cl.loadClass("cb0.db")
+        } catch (e: Throwable) {
+            Log.i(TAG, "cb0.db (compose card stream) not present: $e")
+            return
+        }
+        val instrCls = try {
+            cl.loadClass("com.xiaomi.ai.api.common.Instruction")
+        } catch (e: Throwable) { return }
+        val method = try {
+            clazz.getDeclaredMethod("A0", instrCls)
+        } catch (e: Throwable) {
+            Log.i(TAG, "cb0.db.A0 not found: $e")
+            return
+        }
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    if (injectingNow.get() == true) return
+                    if (!isMutePumpActive()) return
+                    val instruction = param.args[0] ?: return
+                    val payload = try {
+                        instruction.javaClass.getMethod("getPayload").invoke(instruction)
+                    } catch (t: Throwable) { null } ?: return
+                    // ToastStream = 文字内容流;接管期间小爱内容不上 Compose 卡。
+                    // 流状态必须保持(否则 loading 消失、停止按钮挂死),所以**只替换不拦断**:
+                    // 第一块换成「正在思考…」占位,后续块直接拦掉 —— 前端显示一个占位后
+                    // 安静等待,不会循环刷出一堆「正在思考…」。答案注入后 FINAL 由原生逻辑收尾。
+                    if (payload.javaClass.name.endsWith("Template\$ToastStream")) {
+                        composeCardStreamRef = WeakReference(param.thisObject)
+                        if (!placeholderShown.get()) {
+                            try {
+                                val set = payload.javaClass.getMethod("setMarkdownText", String::class.java)
+                                set.invoke(payload, "正在思考…")
+                                placeholderShown.set(true)
+                            } catch (t: Throwable) {
+                                hookStatus("compose ToastStream replace failed: $t")
+                                param.result = null
+                            }
+                        } else {
+                            param.result = null
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.i(TAG, "hookComposeCardStream error: $t")
+                }
+            }
+        })
+        Log.i(TAG, "hooked cb0.db.A0 (compose card stream)")
     }
 
     // 设备版语音识别通道:nl.p.onMessage(Bundle) 是识别结果进入小爱进程的入口
@@ -1749,6 +1813,7 @@ class HookEntry : IXposedHookLoadPackage {
                     // 在 hookBridge 里被滤掉,我们的答案注入时占据的就是原本的回答位置。
                     if (config.speakAnswer) startMutePump(dialogId)
                     session(dialogId).pendingViewAnswer = true
+                    hookStatus("general takeover pump on: $queryText pumpActive=${isMutePumpActive()}")
                     Log.i(TAG, "general takeover (pump on): $queryText")
 
                     // 按「一次问话」归拢:同一句话小爱可能派发多个 dialogId,不能各调各的模型
@@ -1831,6 +1896,10 @@ class HookEntry : IXposedHookLoadPackage {
                     val type = param.args[0] as? String ?: return
                     val content = (param.args[1] as? String).orEmpty()
                     val dialogId = extractDialogId(content)
+                    hookStatus(
+                        "bridge call: type=$type dialogId=${dialogId ?: "-"} pump=${isMutePumpActive()} " +
+                            "content=${content.take(80)}"
+                    )
 
                     // "Finish" / "cancel" 这类控制信令的 content 是空的,里面没有 dialog_id。
                     // 小爱回答简单问题时不到一秒就结束,会抢在我们的答案注入之前把 Finish 发给 JS,
@@ -1962,6 +2031,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 改成持续钳制。只掐主音轨,我们自己的答案在 TOAST_STREAM_TTS 那条音轨上,不受影响。
     private fun startMutePump(dialogId: String, windowMs: Long = 15_000L) {
         mutePumpDialogId = dialogId
+        placeholderShown.set(false)   // 新会话重新放一次占位
         mutePumpUntil = System.currentTimeMillis() + windowMs
         if (mutePumpRunning) return   // 已有泵在跑,上面刷新了截止时间就够了
         mutePumpRunning = true
@@ -2234,6 +2304,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 最终答案由原有的 applyAnswer 路径兜底,流式纯属锦上添花,不承担正确性。
     private fun streamSinkFor(key: String) = object : AiClient.StreamSink {
         override fun onDelta(text: String) {
+            keepMutePumpAlive()
             // 文本约定降级时,工具轮的 <tool_call> 残渣别上屏;节流,避免主线程被 token 刷爆。
             if (text.isBlank() || text.contains("<tool_call")) return
             val now = System.currentTimeMillis()
@@ -2242,14 +2313,89 @@ class HookEntry : IXposedHookLoadPackage {
             pushStreamingText(key, text)
         }
         override fun onComplete(text: String) {
+            keepMutePumpAlive()
             // 定稿:不节流,保证卡片停在完整答案上(节流可能吞掉了最后一帧)。
             lastStreamRenderAt = 0L
             if (text.isNotBlank()) pushStreamingText(key, text)
         }
         override fun onDiscard() {
+            // 工具轮:模型还在跑,给静音泵续命,别让小爱趁工具循环的空档开口。
+            keepMutePumpAlive()
             // 这轮是工具调用:把乐观推上去的正文撤回占位,等下一轮真答案。
             lastStreamRenderAt = 0L
             pushStreamingText(key, THINKING_PLACEHOLDER)
+        }
+    }
+
+    /** 用模块的 classloader 加载小爱进程里的类(默认 Class.forName 找不到宿主类)。 */
+    private fun hostClass(name: String): Class<*>? = try {
+        val cl = targetClassLoader ?: return null
+        Class.forName(name, false, cl)
+    } catch (t: Throwable) {
+        Log.i(TAG, "hostClass $name not found: $t")
+        null
+    }
+
+    /** 构造 ToastStream 指令并送入 Compose 卡流(cb0/db.A0),走原生渲染链路。 */
+    private fun sendToastStreamToCompose(
+        comp: Any, a0: java.lang.reflect.Method, instrCls: Class<*>, dialogId: String, text: String
+    ) {
+        try {
+            val toastCls = hostClass("com.xiaomi.ai.api.Template\$ToastStream") ?: return
+            val toast = toastCls.getConstructor().newInstance()
+            toast.javaClass.getMethod("setMarkdownText", String::class.java).invoke(toast, text)
+            val headerCls = hostClass("com.xiaomi.ai.api.common.InstructionHeader") ?: return
+            val header = headerCls.getConstructor(String::class.java, String::class.java)
+                .newInstance("ToastStream", "Template")
+            header.javaClass.getMethod("setDialogId", String::class.java).invoke(header, dialogId)
+            header.javaClass.getMethod("setId", String::class.java)
+                .invoke(header, UUID.randomUUID().toString())
+            val instr = instrCls.getConstructor(headerCls, Object::class.java)
+                .newInstance(header, toast)
+            a0.invoke(comp, instr)
+        } catch (t: Throwable) {
+            Log.i(TAG, "sendToastStreamToCompose failed: $t")
+        }
+    }
+
+    /** RN 桥整体注入(Compose 流拿不到时的兜底路径)。 */
+    private fun injectViaBridge(
+        bridge: Any, method: java.lang.reflect.Method, dialogId: String, answer: String
+    ) {
+        try {
+            val contentPayload = JSONObject().apply {
+                put("header", JSONObject().apply {
+                    put("name", "ToastStream")
+                    put("namespace", "Template")
+                    put("dialog_id", dialogId)
+                    put("id", UUID.randomUUID().toString().replace("-", ""))
+                    put("transaction_id", UUID.randomUUID().toString().replace("-", ""))
+                })
+                put("payload", JSONObject().apply { put("markdown_text", answer) })
+            }
+            method.invoke(bridge, "instruction", contentPayload.toString())
+            val finalPayload = JSONObject().apply {
+                put("header", JSONObject().apply {
+                    put("id", UUID.randomUUID().toString())
+                    put("dialog_id", dialogId)
+                })
+                put("payload", JSONObject().apply { put("markdown_text", "<FINAL>") })
+            }
+            method.invoke(bridge, "instruction", finalPayload.toString())
+            method.invoke(bridge, "Finish", "")
+            Log.i(TAG, "injected via RN bridge (fallback) dialogId=$dialogId len=${answer.length}")
+        } catch (t: Throwable) {
+            Log.i(TAG, "injectViaBridge failed: $t")
+        }
+    }
+
+    /**
+     * 给静音泵续命:模型调用期间(流式/工具轮)反复刷新截止时间,
+     * 防止复杂问题(工具多轮 20-30 秒)时泵提前超时、小爱回答漏出来。
+     */
+    private fun keepMutePumpAlive() {
+        if (mutePumpUntil > 0L) {
+            mutePumpUntil = System.currentTimeMillis() + 15_000L
         }
     }
 
@@ -2275,6 +2421,10 @@ class HookEntry : IXposedHookLoadPackage {
         Thread {
             try {
                 Log.i(TAG, "calling AI for key=$key ...")
+                // 模型调用发起就把泵窗口拉到 45 秒:复杂问题工具循环 20-30 秒,
+                // 默认 15 秒窗口会在小爱开口前就超时(表现为小爱回答漏出、我们的答案追加在下面)。
+                // 调用期间的流式/工具回调还会继续续命(keepMutePumpAlive)。
+                if (config.speakAnswer) startMutePump(utteranceDialogs[key].orEmpty().firstOrNull() ?: "", 45_000L)
                 // Context 给工具用(装了什么应用、启动应用、调音量都要它)。
                 // 拿不到也能跑,只是那几个工具会返回 "no context available"。
                 //
@@ -2296,6 +2446,8 @@ class HookEntry : IXposedHookLoadPackage {
                 val answer = AiClient.chat(
                     config, queryText, currentApplicationContext(), history, streamSinkFor(key)
                 ) {
+                    // 每轮工具执行前求值;顺带给静音泵续命(工具循环期间小爱不许开口)。
+                    keepMutePumpAlive()
                     val ours = utteranceDialogs[key].orEmpty().any { isOurs(it) }
                     ours || isMutePumpActive()
                 }
@@ -2333,12 +2485,53 @@ class HookEntry : IXposedHookLoadPackage {
         try {
             session(dialogId).aiAnswer = answer
             maybeInject(dialogId)
+            // 答案就绪后无条件收尾(停止生成按钮/流状态),不依赖注入路径是否成功
+            finishComposeStream()
             // 查看类被拦的对话:答案就绪后更新(或补建)答案卡
             if (sessionOrNull(dialogId)?.pendingViewAnswer == true) ensureAnswerCard(dialogId)
             // 历史库同步换成我们的答案,否则回 App 看历史还是那句兜底话术
             writeAnswerToHistory(dialogId, answer)
         } catch (t: Throwable) {
             Log.i(TAG, "applyAnswer failed dialogId=$dialogId: $t")
+        }
+    }
+
+    /**
+     * Compose 层收尾:关掉「停止生成」按钮 + 结束 ToastStreamOperation(s)。
+     * 独立于注入线程 —— 注入可能因 bridge 缺失走别的显示路径,但按钮必须关。
+     */
+    private fun finishComposeStream() {
+        try {
+            val cardCls = hostClass(
+                "com.xiaomi.voiceassistant.instruction.card.stream.ResultOperationComposeCard"
+            )
+            val setBtn = cardCls?.getMethod("setLlmStopGenerateVisible", Boolean::class.javaPrimitiveType)
+            if (setBtn != null) {
+                setBtn.invoke(null, false)
+                hookStatus("stop button cleared via setLlmStopGenerateVisible(false)")
+            } else {
+                hookStatus("setLlmStopGenerateVisible NOT found")
+            }
+        } catch (t: Throwable) {
+            hookStatus("stop button clear failed: $t")
+        }
+        try {
+            val opMgr = hostClass("com.xiaomi.voiceassistant.instruction.base.OperationManager")
+            val sCls = hostClass("pb0.s")
+            val inst = opMgr?.getMethod("getInstance")?.invoke(null)
+            val sOp = opMgr?.getMethod("findOperation", Class::class.java)?.invoke(inst, sCls)
+            if (sOp != null) {
+                val procCls = hostClass("g90.l")
+                val r0 = sOp.javaClass.getDeclaredMethod("r0", procCls)
+                r0.isAccessible = true
+                val proc = sOp.javaClass.getMethod("getOpExecProcedure").invoke(sOp)
+                r0.invoke(sOp, proc)
+                hookStatus("s.r0() called (ToastStreamOperation finished)")
+            } else {
+                hookStatus("s operation not found (already finished?)")
+            }
+        } catch (t: Throwable) {
+            hookStatus("s.r0() failed: $t")
         }
     }
 
@@ -2392,38 +2585,53 @@ class HookEntry : IXposedHookLoadPackage {
             // 小爱给搜索类答案用的 dialogId 和 ASR 那个对不上,老的 takeOver 判据漏了它。
             // 那一漏已由同 commit 新增的静音泵兜底过滤(见 hookBridge)堵死,所以这里恢复
             // 正文块不会让双段回来。
-            try {
-                injectingNow.set(true)
-                val transactionId = UUID.randomUUID().toString().replace("-", "")
-                val contentPayload = JSONObject().apply {
-                    put("header", JSONObject().apply {
-                        put("name", "ToastStream")
-                        put("namespace", "Template")
-                        put("dialog_id", dialogId)
-                        put("id", UUID.randomUUID().toString().replace("-", ""))
-                        put("transaction_id", transactionId)
-                    })
-                    put("payload", JSONObject().apply { put("markdown_text", answer) })
-                }
-                method.invoke(bridge, "instruction", contentPayload.toString())
-                Log.i(TAG, "injected answer via ToastStream dialogId=$dialogId len=${answer.length}")
+            //
+            // 注入放后台线程:**走 Compose 卡原生流(cb0/db.A0)分块推送** ——
+            // 像小爱原生回答那样逐块渲染(逐字效果),并且 FINAL 由原生逻辑收尾
+            // (流状态、停止生成按钮、完成动画全部走原生)。RN 桥(yp0.a)只作兜底。
+            Thread {
+                try {
+                    injectingNow.set(true)
+                    val comp = composeCardStreamRef?.get()
+                    if (comp != null) {
+                        val instrCls: Class<*>? = try {
+                            hostClass("com.xiaomi.ai.api.common.Instruction")
+                        } catch (t: Throwable) { null }
+                        val a0 = if (instrCls != null) {
+                            try { comp.javaClass.getMethod("A0", instrCls) } catch (t: Throwable) { null }
+                        } else null
+                        if (a0 != null) {
+                            // 原生流注入:逐块 ToastStream → A0,前端逐块渲染
+                            val chunkSize = 3
+                            var pos = 0
+                            while (pos < answer.length) {
+                                val chunk = answer.substring(pos, minOf(pos + chunkSize, answer.length))
+                                sendToastStreamToCompose(comp, a0, instrCls!!, dialogId, chunk)
+                                pos += chunkSize
+                                try { Thread.sleep(18) } catch (t: Throwable) { }
+                            }
+                            Log.i(TAG, "compose stream injected (streamed) dialogId=$dialogId len=${answer.length}")
+                            // FINAL:原生逻辑收尾(流完成 → 按钮消失)
+                            sendToastStreamToCompose(comp, a0, instrCls!!, dialogId, "<FINAL>")
+                            Log.i(TAG, "compose stream FINAL sent dialogId=$dialogId")
+                        } else {
+                            // A0 拿不到(版本差异) → 退回 RN 桥整体注入
+                            injectViaBridge(bridge, method, dialogId, answer)
+                        }
+                    } else {
+                        // Compose 实例拿不到 → 退回 RN 桥整体注入
+                        injectViaBridge(bridge, method, dialogId, answer)
+                    }
 
-                val finalPayload = JSONObject().apply {
-                    put("header", JSONObject().apply {
-                        put("id", UUID.randomUUID().toString())
-                        put("dialog_id", dialogId)
-                    })
-                    put("payload", JSONObject().apply { put("markdown_text", "<FINAL>") })
+                    // 停止生成按钮:统一收尾(见 finishComposeStream)
+                    finishComposeStream()
+                } catch (t: Throwable) {
+                    Log.i(TAG, "stream close failed dialogId=$dialogId: $t")
+                    s.injected.set(false)
+                } finally {
+                    injectingNow.set(false)
                 }
-                method.invoke(bridge, "instruction", finalPayload.toString())
-                method.invoke(bridge, "Finish", "")
-                Log.i(TAG, "closed xiaoai stream (<FINAL>+Finish) dialogId=$dialogId")
-            } catch (t: Throwable) {
-                Log.i(TAG, "stream close failed dialogId=$dialogId: $t")
-                s.injected.set(false)
-            } finally {
-                injectingNow.set(false)
-            }
+            }.start()
 
             // p1 设 totalText:**不是显示通道**(理由见上面的注释),但它是「权威文本」——
             // 长按复制、卡片上喇叭按钮重播读的都是它。不设的话那两处还留着小爱的兜底话。

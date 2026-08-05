@@ -16,12 +16,17 @@
 | Hook 点 | 7.513.23.0010(作者测试版) | 7.12.2.0318(本机) |
 |---|---|---|
 | ASR 处理器 | `z10.a` / `processed` | `g10.d` / `filterInstruction` |
+| ASR 识别通道 | (无) | `nl/p.onMessage` |
+| ASR 对话引擎入口 | (无) | `ql/f.interceptInstruction` |
 | RN 桥 | `r70.a` | `yp0.a` |
 | Agent 动作 | `kh0.s0` | `dh0.s0` |
 | ToastStreamPlayer | `la0.n1` | `ea0.n1` |
 | 音轨管理 | `v20.e` | `o20.e` |
 | Toast 卡片 | `jb0.vd` | `instruction.base.b` |
 | UI 导航 | `jb0.ue` | `cb0.qe` |
+| Compose 卡内容流 | (无) | `cb0/db.A0` |
+| ToastStream 操作 | (无) | `pb0/s.r0()` |
+| 停止生成按钮 | (无) | `ResultOperationComposeCard.setLlmStopGenerateVisible` |
 
 ### 特征锚点(ClassProbe 使用的)
 

@@ -143,8 +143,22 @@
 
 `ADAPTATION.md` 记录了完整的版本适配流程：特征锚点清单、dex 扫描/反编译定位方法、映射表更新方式、构建环境备忘。
 
+### 新增的设备版适配（回答占位链路）
+
+设备版小爱回答内容走 **Compose 卡片**（`cb0/db.A0`，TemplateFrontendPageOperation），**不经过** RN 桥——作者版的 bridge 拦截对设备版无效。本 Fork 新增：
+
+| 适配点 | 设备版类 | 说明 |
+| --- | --- | --- |
+| Compose 卡内容拦截 | `cb0/db.A0` | 接管期间小爱内容替换为「正在思考…」占位（流状态保持，不整段拦断） |
+| 停止生成按钮 | `ResultOperationComposeCard.setLlmStopGenerateVisible(false)` | 答案就绪后无条件关闭 |
+| ToastStream 流收尾 | `pb0/s.r0()` | 结束 ToastStreamOperation，流状态归位 |
+| 语音识别入口 | `ql/f.interceptInstruction` + `nl/p.onMessage` | 设备版 ASR 识别结果的两个入口（识别文本最终也走 setQueryInfo 统一接管） |
+
+**注入策略**：优先走 Compose 原生流（`cb0/db.A0` 分块推送，前端原生渲染），拿不到时回退 RN 桥整体注入。
+
 ### 已知限制
 
+- **逐字流式**：Compose 原生流注入在部分场景下前端仍整体渲染，与原生逐字效果有差异（不影响功能）。
 - **语音播报**：设备版 `ea0.n1` 无 `speakTts` 等价入口，接管后不播报 TTS（卡片文字正常显示）。
 - 小爱功能重构（锚点消失）时需按 `ADAPTATION.md` 人工适配一次。
 
