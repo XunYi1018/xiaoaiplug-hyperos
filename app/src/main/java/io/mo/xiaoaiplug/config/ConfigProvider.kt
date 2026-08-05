@@ -99,6 +99,33 @@ class ConfigProvider : ContentProvider() {
 
         private const val PREFS_NAME = "xiaoai_plug_config"
 
+        /** prefs 缓存失配时,这些键直接从磁盘 XML 解析兜底(见 [readKeyFromPrefsFile])。 */
+        private val FILE_FALLBACK_KEYS = setOf(
+            ConfigKeys.PROVIDER, ConfigKeys.ENDPOINT, ConfigKeys.API_KEY, ConfigKeys.MODEL,
+            ConfigKeys.ENABLED
+        )
+
+        /**
+         * 直接从 prefs XML 文件解析指定键。外部注入配置(adb/root 写文件)后,
+         * SharedPreferences 的内存缓存可能不刷新,这里保证读取的是磁盘最新值。
+         */
+        private fun readKeyFromPrefsFile(key: String): String? {
+            return try {
+                val f = java.io.File(
+                    android.os.Environment.getDataDirectory(),
+                    "user/0/io.mo.xiaoaiplug/shared_prefs/$PREFS_NAME.xml"
+                )
+                if (!f.exists()) return null
+                val content = f.readText()
+                val marker = "<string name=\"$key\">"
+                val start = content.indexOf(marker)
+                if (start < 0) return null
+                val end = content.indexOf("</string>", start)
+                if (end < 0) return null
+                content.substring(start + marker.length, end)
+            } catch (t: Throwable) { null }
+        }
+
         /**
          * 允许调用本 provider 的包名。
          *
@@ -160,7 +187,13 @@ class ConfigProvider : ContentProvider() {
                     // 和"用户手动清空"(就是要它不生效),两者在存进 SharedPreferences 后都是空串,
                     // 只有靠"存过没存过"才分得开。
                     val fallback = if (k == ConfigKeys.SKIP_TAKEOVER_PATTERN) DEFAULT_SKIP_TAKEOVER_PATTERN else ""
-                    out.putString(k, p.getString(k, fallback))
+                    var v = p.getString(k, fallback)
+                    // 兜底:prefs 内存缓存与磁盘不一致(比如外部注入配置后缓存未刷新)时,
+                    // 直接从 XML 文件解析关键键,保证 hook 侧始终能拿到最新配置。
+                    if (v.isNullOrEmpty() && k in FILE_FALLBACK_KEYS) {
+                        v = readKeyFromPrefsFile(k)
+                    }
+                    out.putString(k, v)
                 }
                 out
             }

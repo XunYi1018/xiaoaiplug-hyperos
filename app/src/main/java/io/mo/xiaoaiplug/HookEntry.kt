@@ -8,6 +8,7 @@ import io.mo.xiaoaiplug.config.AiClient
 import io.mo.xiaoaiplug.config.AiConfig
 import io.mo.xiaoaiplug.config.ChatHistory
 import io.mo.xiaoaiplug.config.ConfigClient
+import io.mo.xiaoaiplug.hook.ClassProbe
 import io.mo.xiaoaiplug.hook.SettingsHook
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -29,8 +30,14 @@ private const val SETTINGS_PKG = "com.android.settings"
 
 private const val OPERATION_MANAGER_CLASS = "com.xiaomi.voiceassistant.instruction.base.OperationManager"
 private const val RN_CARD_CLASS = "com.xiaomi.voiceassistant.instruction.card.TemplateReactNativeCard"
-private const val BRIDGE_CLASS = "r70.a"
-private const val AUDIO_TRACK_MANAGER_CLASS = "v20.e"
+
+/**
+ * 混淆类名随小爱版本变化(作者测试版 7.513.23.0010 与设备版 7.12.2.0318 的类名/方法名
+ * 都不同)。每个 hook 点维护一个候选数组:逐个 loadClass,第一个成功的即该版本实际类。
+ * 新版本失配时往数组里加新类名即可,不用改 hook 逻辑。
+ */
+private val BRIDGE_CLASSES = listOf("r70.a", "yp0.a")
+private val AUDIO_TRACK_MANAGER_CLASSES = listOf("v20.e", "o20.e")
 
 // 我们自己的答案播在这条音轨上(n1.speakTts 用的),静音时必须跳过它。
 // 其余的(main / tts / getAuthorization / getNoAccountAuthorization)都是小爱在说话。
@@ -41,7 +48,7 @@ private const val OUR_AUDIO_TRACK = "toastStreamTts"
 // 优先用它而不是 u1.speak:我们的答案是**延迟几秒**才到的,那时小爱的会话常常已经拆了,
 // 而 u1.speak(String) 内部有 `if (this.f56104f != null)` 守卫(f56104f 是 y00.h 引擎),
 // 引擎为 null 时它静默丢弃、一声不吭。n1 设计上就是给"会话早结束、用户回头点重播"用的。
-private const val TOAST_STREAM_PLAYER_CLASS = "la0.n1"
+private val TOAST_STREAM_PLAYER_CLASSES = listOf("la0.n1", "ea0.n1")
 
 // 小爱自己的 TTS 入口:u1.getInstance().speak(String) 内部会造 t20.e(SelectedVendorTtsRequest,
 // 构造时 updateSettings() 自动带上当前音色/音源设置)交给 y00.h → f10.j1 合成播报。
@@ -54,7 +61,7 @@ private const val TTS_BRIDGE_CLASS = "com.xiaomi.voiceassistant.u1"
 // 为什么要它:真机日志显示"跳设置"那条 Agent Action 在 setQueryInfo **之前** 334ms 就发出去了,
 // 那时 lastQueryText 还停在上一句,按问话判定必然失效。而终态 ASR 比 Agent Action 早 266ms、
 // 比 setQueryInfo 早 600ms,在这里记问话才来得及拦。
-private const val ASR_PROCESSOR_CLASS = "z10.a"
+private val ASR_PROCESSOR_CLASSES = listOf("z10.a", "g10.d")
 private const val ASR_RECOGNIZE_RESULT = "SpeechRecognizer.RecognizeResult"
 
 // AgentActionManager —— 「查看X→跳设置」的**第三条**路,和另外两条完全无关。
@@ -62,13 +69,13 @@ private const val ASR_RECOGNIZE_RESULT = "SpeechRecognizer.RecognizeResult"
 //   urn:aiot-spec-v3:com.mi.phones:action:[com.miui.securitycenter/powercenter/go_power_model_setting]:0:1.0
 // 经 binder 交给 AiCr 引擎,最终由 com.miui.securitycenter 自己 startActivity 打开自己的页面。
 // 所以 IntentUtilsWrapper / m2 那两个 hook 结构上就抓不到它,只能在小爱侧这个收口拦。
-private const val AGENT_ACTION_CLASS = "kh0.s0"
+private val AGENT_ACTION_CLASSES = listOf("kh0.s0", "dh0.s0")
 
 // TemplateToastOperation —— 小爱那些固定话术卡片的生成处(「应用已经不支持这个功能啦」之类)。
 // 卡片和语音是两条独立的路:语音被静音泵掐掉了,但卡片照样显示 —— 所以还得单独拦这里。
 // g0/i0 都返回 com.xiaomi.voiceassistant.card.a,且它们自己就有 return null 的分支
 // (isScenesOp / isSimulatingClick),说明返回 null 是小爱支持的正常结果,拦起来安全。
-private const val TOAST_OPERATION_CLASS = "jb0.vd"
+private val TOAST_OPERATION_CLASSES = listOf("jb0.vd", "com.xiaomi.voiceassistant.instruction.base.b")
 
 // UIControllerNavigate 操作(jb0.ue)—— 小爱对"杀/清后台"的**原生**反应其实不是杀,
 // 而是走 NavigateOp.OPEN_BACKGROUND_APPS 分支、由 z0() 模拟按下最近任务键
@@ -77,7 +84,7 @@ private const val TOAST_OPERATION_CLASS = "jb0.vd"
 // 这条命令**从不调 killAppByPkgName**,那段"清后台动画"就是这次 APP_SWITCH。真正的杀是我们干的,
 // 所以我们接管这轮时要把这一下按键跳过 —— 否则先划出最近任务界面、我们再 force-stop,两边各干各的。
 // z0() 只在 OPEN_BACKGROUND_APPS 这一个分支被调,单独拦它不影响别的导航(回主页/退小爱等)。
-private const val UI_NAV_OPERATION_CLASS = "jb0.ue"
+private val UI_NAV_OPERATION_CLASSES = listOf("jb0.ue", "cb0.qe")
 
 // SpeakContentManager —— 小爱"这一轮该念什么"的权威文本源。
 // jb0.hb 把 SpeakStream 分片 addFragment() 累积进去;卡片上那个喇叭按钮
@@ -189,6 +196,87 @@ private val BT_CONN_QUESTION = Regex("怎么|如何|怎样|为什么")
 
 // 判定"跳转目标确实是系统设置/系统应用",避免误伤导航/打开第三方应用之类的正常跳转
 class HookEntry : IXposedHookLoadPackage {
+
+    /**
+     * 多版本候选类解析:逐个尝试 loadClass,第一个成功的即该版本的实际类。
+     * 候选数组里旧版类名在前、新版在后 —— 作者测试版(7.513.23.0010)用前者,
+     * 设备版(7.12.2.0318)命中后者,新版本继续往数组末尾追加即可。
+     */
+    private fun resolveClass(cl: ClassLoader, candidates: List<String>, what: String): Class<*>? {
+        for (name in candidates) {
+            try {
+                return cl.loadClass(name)
+            } catch (e: Throwable) {
+                Log.i(TAG, "$what candidate $name not present: ${e.message}")
+            }
+        }
+        Log.i(TAG, "$what: none of $candidates present, probing dex by feature...")
+        // 候选全失败 → 运行时特征探测:混淆类名随版本变化时,按字符串锚点/方法签名
+        // 在小爱 APK 的 dex 里自动定位对应类,大多数版本更新无需人工适配。
+        val apkPath = try {
+            currentApplicationContext()?.applicationInfo?.sourceDir
+        } catch (t: Throwable) { null }
+        if (apkPath != null) {
+            val found = ClassProbe.find(apkPath, featureFor(what))
+            if (found != null) {
+                Log.i(TAG, "$what: feature probe resolved $found")
+                return try {
+                    cl.loadClass(found)
+                } catch (e: Throwable) {
+                    Log.i(TAG, "$what: probe class load failed: $e")
+                    null
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * 各 hook 点的特征定义(供 [ClassProbe] 在候选类名全部失效时自动定位)。
+     * 锚点选混淆不碰的东西:字符串字面量、未混淆方法名(JS 桥/API 名)、Kotlin object 结构。
+     * 小爱功能重构导致特征也失配时,这里需要对照新版本补特征(见 ADAPTATION.md)。
+     */
+    private fun featureFor(what: String): ClassProbe.Feature = when (what) {
+        // ASR 指令处理器:处理 SpeechRecognizer.RecognizeResult
+        "ASR processor" -> ClassProbe.Feature(
+            name = what,
+            requiredStrings = listOf("SpeechRecognizer.RecognizeResult"),
+            requiredMethodNames = listOf("processed", "filterInstruction")
+        )
+        // RN 桥:JS 侧回调 Java 的方法名不能混淆
+        "RN bridge" -> ClassProbe.Feature(
+            name = what,
+            requiredMethodNames = listOf("sendStreamData")
+        )
+        // Agent 动作执行器
+        "Agent action" -> ClassProbe.Feature(
+            name = what,
+            requiredMethodNames = listOf("executeActionsAsync")
+        )
+        // ToastStreamPlayer:Kotlin object + 自己的 TAG
+        "ToastStreamPlayer" -> ClassProbe.Feature(
+            name = what,
+            requiredStrings = listOf("ToastStreamPlayer"),
+            requireSingleton = true
+        )
+        // 音轨管理:toastStreamTts 轨的注册表
+        "Audio track manager" -> ClassProbe.Feature(
+            name = what,
+            requiredStrings = listOf("toastStreamTts")
+        )
+        // 固定话术卡片生成:g0(int)/i0(int)
+        "Toast operation" -> ClassProbe.Feature(
+            name = what,
+            methodArity = listOf("g0" to 1, "i0" to 1)
+        )
+        // UI 导航:z0() 模拟按键
+        "UI nav operation" -> ClassProbe.Feature(
+            name = what,
+            requiredStrings = listOf("setSimulateKeyEvent"),
+            requiredMethodNames = listOf("z0")
+        )
+        else -> ClassProbe.Feature(name = what)
+    }
 
     /** 把本模块进程里的 ModuleStatus.isActive() 替换成返回 true(见 ModuleStatus 的注释)。 */
     private fun hookSelfProbe(cl: ClassLoader) {
@@ -442,17 +530,15 @@ class HookEntry : IXposedHookLoadPackage {
     // 在**终态 ASR** 就把问话记下来。比 setQueryInfo 早 600ms,比"跳设置"的 Agent Action 早 266ms ——
     // 这 266ms 正是能不能拦住那条跳转的全部余量。
     private fun hookAsrResult(cl: ClassLoader) {
-        val clazz = try {
-            cl.loadClass(ASR_PROCESSOR_CLASS)
-        } catch (e: Throwable) {
-            Log.i(TAG, "$ASR_PROCESSOR_CLASS not found: $e")
-            return
-        }
+        val clazz = resolveClass(cl, ASR_PROCESSOR_CLASSES, "ASR processor") ?: return
+        // 方法名也随版本变:作者版 z10.a.processed(Instruction)(1 参);
+        // 设备版 g10.d.filterInstruction(Instruction, engineIdPrefix)(2 参,args[0] 同样是指令)。
         val method = clazz.declaredMethods.firstOrNull {
-            it.name == "processed" && it.parameterTypes.size == 1
+            (it.name == "processed" || it.name == "filterInstruction") &&
+                it.parameterTypes.isNotEmpty()
         }
         if (method == null) {
-            Log.i(TAG, "z10.a.processed(Instruction) not found")
+            Log.i(TAG, "ASR processor processed/filterInstruction not found")
             return
         }
         try {
@@ -542,12 +628,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 同一场景,它的卡看得见。既然如此就别再往里塞自己的卡:让小爱照常创建、布局、显示,
     // 我们只把内容换成自己的。容器、时机、显示模式全部沿用它的机制。
     private fun hookToastCard(cl: ClassLoader) {
-        val clazz = try {
-            cl.loadClass(TOAST_OPERATION_CLASS)
-        } catch (e: Throwable) {
-            Log.i(TAG, "$TOAST_OPERATION_CLASS not found: $e")
-            return
-        }
+        val clazz = resolveClass(cl, TOAST_OPERATION_CLASSES, "Toast operation") ?: return
         val targets = clazz.declaredMethods.filter {
             (it.name == "g0" || it.name == "i0") &&
                 it.parameterTypes.size == 1 && it.parameterTypes[0] == Integer.TYPE
@@ -587,12 +668,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 由 root shell 真正 force-stop,所以这下按键跳过即可 —— 否则先划出最近任务界面再由我们杀,
     // 观感是两边各干各的。只在 ownsKillTurnNow()(确是我们接管的杀后台轮)时跳过,不误伤正常导航。
     private fun hookBackgroundAppsNav(cl: ClassLoader) {
-        val clazz = try {
-            cl.loadClass(UI_NAV_OPERATION_CLASS)
-        } catch (e: Throwable) {
-            Log.i(TAG, "$UI_NAV_OPERATION_CLASS not found: $e")
-            return
-        }
+        val clazz = resolveClass(cl, UI_NAV_OPERATION_CLASSES, "UI nav operation") ?: return
         // z0() 无参、只做 setSimulateKeyEvent(187);按名字精确取,取不到就算了(混淆改名时不至于拖垮别的)
         val method = clazz.declaredMethods.firstOrNull {
             it.name == "z0" && it.parameterTypes.isEmpty()
@@ -633,12 +709,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 拦第三条跳转路:AgentActionManager。两个 executeActionsAsync 重载都挂上,
     // 顺带把它们汇入的 execute 也挂上,免得有调用方绕过重载直接进去。
     private fun hookAgentAction(cl: ClassLoader) {
-        val clazz = try {
-            cl.loadClass(AGENT_ACTION_CLASS)
-        } catch (e: Throwable) {
-            Log.i(TAG, "$AGENT_ACTION_CLASS not found: $e")
-            return
-        }
+        val clazz = resolveClass(cl, AGENT_ACTION_CLASSES, "Agent action") ?: return
         val targets = clazz.declaredMethods.filter {
             it.name == "executeActionsAsync" || it.name == "execute"
         }
@@ -1665,12 +1736,7 @@ class HookEntry : IXposedHookLoadPackage {
     //  - 对已接管的 dialogId,拦下真实内容(不让原方法执行,即不显示小爱自己的回答)
     //  - 我们自己发起的调用(injectingNow=true)直接放行
     private fun hookBridge(cl: ClassLoader) {
-        val clazz = try {
-            cl.loadClass(BRIDGE_CLASS)
-        } catch (e: Throwable) {
-            Log.i(TAG, "$BRIDGE_CLASS not found: $e")
-            return
-        }
+        val clazz = resolveClass(cl, BRIDGE_CLASSES, "RN bridge") ?: return
         val method = try {
             clazz.getDeclaredMethod("sendStreamData", String::class.java, String::class.java)
         } catch (e: Throwable) {
@@ -1917,12 +1983,19 @@ class HookEntry : IXposedHookLoadPackage {
 
     // 走卡片自己的 ToastStreamPlayer。会话已经拆掉也能播,而且播放状态监听会驱动喇叭图标动画。
     private fun speakViaToastPlayer(cl: ClassLoader, text: String): Boolean {
+        val clazz = resolveClass(cl, TOAST_STREAM_PLAYER_CLASSES, "ToastStreamPlayer") ?: return false
         return try {
-            val clazz = cl.loadClass(TOAST_STREAM_PLAYER_CLASS)
             val instance = kotlinObjectInstance(clazz) ?: return false
-            clazz.getMethod("stopPlay").invoke(instance)
-            // speakTts 成功返回合成事件 id,文本为空时返回 null
-            val speakId = clazz.getMethod("speakTts", String::class.java).invoke(instance, text)
+            // 停止上一段:作者版 stopPlay;设备版(7.12.2.0318)同名方法已混淆成 c()(releaseEngine)。
+            // 用候选名逐个尝试,新版本改名只需往数组里加。
+            runCatching { clazz.getMethod("stopPlay").invoke(instance) }
+                .getOrElse { clazz.getMethod("c").invoke(instance) }
+            // speakTts 成功返回合成事件 id,文本为空时返回 null。
+            // 设备版没有等价入口(混淆后无 speakTts 对应物),返回 null → 不播报,只出卡片。
+            // 播报兜底会落到 speakViaEngine(TTS_BRIDGE_CLASS,u1),那条路设备版可用。
+            val speakId = runCatching {
+                clazz.getMethod("speakTts", String::class.java).invoke(instance, text)
+            }.getOrNull()
             speakId != null
         } catch (t: Throwable) {
             Log.i(TAG, "speakViaToastPlayer failed: $t")
@@ -1993,7 +2066,9 @@ class HookEntry : IXposedHookLoadPackage {
     private fun muteAudio() {
         try {
             val ctx = currentApplicationContext() ?: return
-            val clazz = ctx.classLoader.loadClass(AUDIO_TRACK_MANAGER_CLASS)
+            val clazz = resolveClass(
+                ctx.classLoader, AUDIO_TRACK_MANAGER_CLASSES, "Audio track manager"
+            ) ?: return
             val tracks = allAudioTracks(clazz)
             if (tracks.isEmpty()) {
                 muteMainTrackOnly(clazz)   // 注册表拿不到就退回老做法,至少掐住主音轨
