@@ -28,6 +28,19 @@
 | ToastStream 操作 | (无) | `pb0/s.r0()` |
 | 停止生成按钮 | (无) | `ResultOperationComposeCard.setLlmStopGenerateVisible` |
 
+**7.13.32.0016（Xiaomi 14 Pro）追加映射**（与 7.12 同构，候选数组已含）：
+
+| Hook 点 | 7.13 类 |
+|---|---|
+| Compose 卡内容流 | `jb0/hb.A0`（与 cb0/db 同构：TAG/`<FINAL>`/N 字段一致） |
+| ToastStream 操作 | `wb0/s.r0(n90.l)`（注意 r0 参数类型是 n90.l 而非 7.12 的 g90.l） |
+| 停止生成按钮 | `ResultOperationComposeCard`（不变） |
+
+**回答链路关键经验**（7.12/7.13 实测）：
+- FINAL **不要**走 A0——A0 的 `<FINAL>` 触发 `t0()` → `P.dispose()` 销毁 Compose 卡前端状态，复制/分享按钮消失。FINAL 应走 RN 桥（yp0.a）。
+- 占位不能依赖小爱流（可能被 bridge 层滤掉、到不了 A0）或 answerCard（7.13 上经常缺失）——**主动经 RN 桥推**（bridge 就绪时补推）。
+- 停止按钮的 `setLlmStopGenerateVisible(false)` 必须在 **UI 线程**调用（跨线程只改状态、界面不刷新）。
+
 ### 特征锚点(ClassProbe 使用的)
 
 | Hook 点 | 字符串锚点 | 方法锚点 |
