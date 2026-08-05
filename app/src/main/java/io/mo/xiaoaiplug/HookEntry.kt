@@ -61,7 +61,7 @@ private const val TTS_BRIDGE_CLASS = "com.xiaomi.voiceassistant.u1"
 // 为什么要它:真机日志显示"跳设置"那条 Agent Action 在 setQueryInfo **之前** 334ms 就发出去了,
 // 那时 lastQueryText 还停在上一句,按问话判定必然失效。而终态 ASR 比 Agent Action 早 266ms、
 // 比 setQueryInfo 早 600ms,在这里记问话才来得及拦。
-private val ASR_PROCESSOR_CLASSES = listOf("z10.a", "g10.d")
+private val ASR_PROCESSOR_CLASSES = listOf("z10.a", "g10.d", "ql.f")
 private const val ASR_RECOGNIZE_RESULT = "SpeechRecognizer.RecognizeResult"
 
 // AgentActionManager —— 「查看X→跳设置」的**第三条**路,和另外两条完全无关。
@@ -479,11 +479,20 @@ class HookEntry : IXposedHookLoadPackage {
         hookChatHistory(lpparam.classLoader)
         hookCardSinks(lpparam.classLoader)
         hookAsrResult(lpparam.classLoader)
+        hookAsrChannel(lpparam.classLoader)
         hookAgentAction(lpparam.classLoader)
         hookToastCard(lpparam.classLoader)
         hookIntentLaunch(lpparam.classLoader)
         hookToastCardBind(lpparam.classLoader)
         hookBackgroundAppsNav(lpparam.classLoader)
+    }
+
+    /** 诊断辅助:写文件绕开 MIUI 对小爱进程 logcat 的过滤。验证完可删。 */
+    private fun hookStatus(msg: String) {
+        try {
+            java.io.File("/data/data/com.miui.voiceassist/files/xiaoai_hook.txt")
+                .appendText("${System.currentTimeMillis()} $msg\n")
+        } catch (t: Throwable) { }
     }
 
     // 「查看类」不跳转:拦截 IntentUtilsWrapper.startActivitySafely(Intent, boolean)。
@@ -532,9 +541,11 @@ class HookEntry : IXposedHookLoadPackage {
     private fun hookAsrResult(cl: ClassLoader) {
         val clazz = resolveClass(cl, ASR_PROCESSOR_CLASSES, "ASR processor") ?: return
         // 方法名也随版本变:作者版 z10.a.processed(Instruction)(1 参);
-        // 设备版 g10.d.filterInstruction(Instruction, engineIdPrefix)(2 参,args[0] 同样是指令)。
+        // 设备版 g10.d.filterInstruction(Instruction, engineIdPrefix)(2 参,args[0] 同样是指令);
+        // 设备版对话引擎 ql/f.interceptInstruction(Instruction)(识别结果真实入口)。
         val method = clazz.declaredMethods.firstOrNull {
-            (it.name == "processed" || it.name == "filterInstruction") &&
+            (it.name == "processed" || it.name == "filterInstruction" ||
+                it.name == "interceptInstruction") &&
                 it.parameterTypes.isNotEmpty()
         }
         if (method == null) {
@@ -546,68 +557,10 @@ class HookEntry : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     try {
                         val instruction = param.args[0] ?: return
-                        val fullName = instruction.javaClass.getMethod("getFullName")
-                            .invoke(instruction) as? String ?: return
-                        if (fullName != ASR_RECOGNIZE_RESULT) return
-                        val payload = instruction.javaClass.getMethod("getPayload")
-                            .invoke(instruction) ?: return
-                        // 只认终态,中间的 partial 结果会随着用户说话不断变
-                        val isFinal = payload.javaClass.getMethod("isFinal")
-                            .invoke(payload) as? Boolean ?: false
-                        if (!isFinal) return
-                        val results = payload.javaClass.getMethod("getResults")
-                            .invoke(payload) as? List<*> ?: return
-                        val text = results.filterNotNull().joinToString("") {
-                            (it.javaClass.getMethod("getText").invoke(it) as? String).orEmpty()
-                        }
-                        if (text.isBlank()) return
-                        val dialogId = optionalString(
-                            instruction.javaClass.getMethod("getDialogId").invoke(instruction)
-                        ).orEmpty()
-
-                        val ctx = currentApplicationContext()
-                        val config = if (ctx != null) ConfigClient.read(ctx) else null
-                        if (config != null) lastConfig = config
-
-                        // ASR 会把一句话切成两段:实测"现在的WIFI WIFI密码是多少"之后 1.8 秒
-                        // 又来了一次 asr final text="呜呜"(说话的尾音)。它带着新 dialogId 走完整流程,
-                        // 于是停了我们的静音泵、改写了 lastQueryText,连带小爱自己也重置了卡片列表,
-                        // 把我们 1.5 秒前加的占位卡冲掉 —— 现象就是"有语音没卡片"。
-                        // 这里挡掉这种碎片:模型调用还在飞、时间很近、内容又短又不像提问,就当没听见。
-                        val elapsed = System.currentTimeMillis() - lastQueryTime
-                        val junk = text.length <= 3 &&
-                            (config == null || !isViewBlockCandidate(text, config))
-                        if (junk && elapsed < 5_000L && utteranceCalling.isNotEmpty()) {
-                            Log.i(TAG, "ignore ASR fragment \"$text\" (answer still pending, ${elapsed}ms after last query)")
-                            return
-                        }
-
-                        if (text != lastQueryText) stopMutePump()
-                        lastQueryText = text
-                        lastQueryTime = System.currentTimeMillis()
-                        // 原文单独留一份 —— 稍后 setQueryInfo 会用改写过的版本覆盖 lastQueryText
-                        lastAsrText = text
-                        lastAsrTime = lastQueryTime
-                        if (dialogId.isNotBlank()) lastDialogId = dialogId
-                        Log.i(TAG, "asr final: dialogId=$dialogId text=$text")
-
-                        // 这一刻就能判定"这句我们自己答" → 立刻起泵,比小爱起播早得多。
-                        //
-                        // 发消息类**必须**和查看类一样在这里起泵,不能只靠 setQueryInfo 那处。
-                        // 实测「打开微信给文件传输助手发你好」:
-                        //   41.625 asr final → 41.924 SpeechSynthesizer.Speak(小爱 299ms 就开口)
-                        //   → 42.008 mute pump started(setQueryInfo 路径,383ms)
-                        // 晚了 84ms,那句"暂不支持微信双开功能"就漏出去了 —— 现象是先播报
-                        // 失败话术、然后消息才被我们发出去。查看类当初就是因为这个把泵前移到
-                        // 这里的(见 setQueryInfo 那处注释),发消息这条路当时漏打了。
-                        if (config != null && config.enabled && config.speakAnswer &&
-                            dialogId.isNotBlank() &&
-                            (isViewBlockCandidate(text, config) || isSendMessageCommand(text) ||
-                                isKillBackgroundCommand(text) || isAppControlCommand(text))
-                        ) {
-                            session(dialogId).pendingViewAnswer = true
-                            startMutePump(dialogId)
-                        }
+                        hookStatus("ASR instruction (filterInstruction/processed): ${
+                            instruction.javaClass.name
+                        }")
+                        handleAsrInstruction(instruction)
                     } catch (t: Throwable) {
                         Log.i(TAG, "hookAsrResult error: $t")
                     }
@@ -616,6 +569,124 @@ class HookEntry : IXposedHookLoadPackage {
             Log.i(TAG, "hooked z10.a.processed (asr)")
         } catch (t: Throwable) {
             Log.i(TAG, "hook asr fail: $t")
+        }
+    }
+
+    // 设备版语音识别通道:nl.p.onMessage(Bundle) 是识别结果进入小爱进程的入口
+    // (反序列化 instruction 后设置 isFinal 再分发)。作者版没有这条路径,
+    // 7.12.2.0318 上语音识别结果走它而不是 g10.d.filterInstruction。
+    private fun hookAsrChannel(cl: ClassLoader) {
+        val clazz = try {
+            cl.loadClass("nl.p")
+        } catch (e: Throwable) {
+            Log.i(TAG, "nl.p (asr channel) not present: $e")
+            hookStatus("ASR channel nl.p NOT present in this process")
+            return
+        }
+        val method = try {
+            clazz.getDeclaredMethod("onMessage", android.os.Bundle::class.java)
+        } catch (e: Throwable) {
+            Log.i(TAG, "nl.p.onMessage not found: $e")
+            hookStatus("nl.p.onMessage NOT found in this process")
+            return
+        }
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    val bundle = param.args[0] as? android.os.Bundle ?: return
+                    hookStatus("ASR channel onMessage arrived in ${java.lang.Thread.currentThread().name}")
+                    val raw = bundle.getString("instruction") ?: return
+                    hookStatus("ASR channel onMessage: ${raw.take(120)}")
+                    // 反序列化 instruction(com.xiaomi.ai.api.common.APIUtils.readInstruction)
+                    val instruction = try {
+                        Class.forName("com.xiaomi.ai.api.common.APIUtils")
+                            .getMethod("readInstruction", String::class.java)
+                            .invoke(null, raw)
+                    } catch (t: Throwable) {
+                        Log.i(TAG, "readInstruction failed: $t")
+                        null
+                    } ?: return
+                    handleAsrInstruction(instruction)
+                } catch (t: Throwable) {
+                    Log.i(TAG, "hookAsrChannel error: $t")
+                }
+            }
+        })
+        Log.i(TAG, "hooked nl.p.onMessage (asr channel)")
+    }
+
+    /**
+     * 统一的 ASR 终态处理:拿到 SpeechRecognizer.RecognizeResult 指令后
+     * 记录问话并判定接管。语音识别的多个入口(filterInstruction / nl.p.onMessage)
+     * 最终都汇聚到这里。
+     */
+    private fun handleAsrInstruction(instruction: Any) {
+        try {
+            val fullName = instruction.javaClass.getMethod("getFullName")
+                .invoke(instruction) as? String ?: return
+            hookStatus("ASR instruction: $fullName")
+            if (fullName != ASR_RECOGNIZE_RESULT) return
+            val payload = instruction.javaClass.getMethod("getPayload")
+                .invoke(instruction) ?: return
+            // 只认终态,中间的 partial 结果会随着用户说话不断变
+            val isFinal = payload.javaClass.getMethod("isFinal")
+                .invoke(payload) as? Boolean ?: false
+            if (!isFinal) return
+            val results = payload.javaClass.getMethod("getResults")
+                .invoke(payload) as? List<*> ?: return
+            val text = results.filterNotNull().joinToString("") {
+                (it.javaClass.getMethod("getText").invoke(it) as? String).orEmpty()
+            }
+            if (text.isBlank()) return
+            val dialogId = optionalString(
+                instruction.javaClass.getMethod("getDialogId").invoke(instruction)
+            ).orEmpty()
+
+            val ctx = currentApplicationContext()
+            val config = if (ctx != null) ConfigClient.read(ctx) else null
+            if (config != null) lastConfig = config
+
+            // ASR 会把一句话切成两段:实测"现在的WIFI WIFI密码是多少"之后 1.8 秒
+            // 又来了一次 asr final text="呜呜"(说话的尾音)。它带着新 dialogId 走完整流程,
+            // 于是停了我们的静音泵、改写了 lastQueryText,连带小爱自己也重置了卡片列表,
+            // 把我们 1.5 秒前加的占位卡冲掉 —— 现象就是"有语音没卡片"。
+            // 这里挡掉这种碎片:模型调用还在飞、时间很近、内容又短又不像提问,就当没听见。
+            val elapsed = System.currentTimeMillis() - lastQueryTime
+            val junk = text.length <= 3 &&
+                (config == null || !isViewBlockCandidate(text, config))
+            if (junk && elapsed < 5_000L && utteranceCalling.isNotEmpty()) {
+                Log.i(TAG, "ignore ASR fragment \"$text\" (answer still pending, ${elapsed}ms after last query)")
+                return
+            }
+
+            if (text != lastQueryText) stopMutePump()
+            lastQueryText = text
+            lastQueryTime = System.currentTimeMillis()
+            // 原文单独留一份 —— 稍后 setQueryInfo 会用改写过的版本覆盖 lastQueryText
+            lastAsrText = text
+            lastAsrTime = lastQueryTime
+            if (dialogId.isNotBlank()) lastDialogId = dialogId
+            Log.i(TAG, "asr final: dialogId=$dialogId text=$text")
+
+            // 这一刻就能判定"这句我们自己答" → 立刻起泵,比小爱起播早得多。
+            //
+            // 发消息类**必须**和查看类一样在这里起泵,不能只靠 setQueryInfo 那处。
+            // 实测「打开微信给文件传输助手发你好」:
+            //   41.625 asr final → 41.924 SpeechSynthesizer.Speak(小爱 299ms 就开口)
+            //   → 42.008 mute pump started(setQueryInfo 路径,383ms)
+            // 晚了 84ms,那句"暂不支持微信双开功能"就漏出去了 —— 现象是先播报
+            // 失败话术、然后消息才被我们发出去。查看类当初就是因为这个把泵前移到
+            // 这里的(见 setQueryInfo 那处注释),发消息这条路当时漏打了。
+            if (config != null && config.enabled && config.speakAnswer &&
+                dialogId.isNotBlank() &&
+                (isViewBlockCandidate(text, config) || isSendMessageCommand(text) ||
+                    isKillBackgroundCommand(text) || isAppControlCommand(text))
+            ) {
+                session(dialogId).pendingViewAnswer = true
+                startMutePump(dialogId)
+            }
+        } catch (t: Throwable) {
+            Log.i(TAG, "handleAsrInstruction error: $t")
         }
     }
 
@@ -1671,6 +1742,15 @@ class HookEntry : IXposedHookLoadPackage {
                     if (sessionOrNull(dialogId)?.queryText != null) return
                     session(dialogId).queryText = queryText
 
+                    // 通用接管:这轮由我们回答 → 立刻起泵压住小爱的播报和卡片流。
+                    // 不加这一下,普通问题(「现在几点了」这类不在上面任何类别里的)会由小爱
+                    // 先答完上屏,我们的答案 10 多秒后才到,只能追加在它下面 —— 真机现象就是
+                    // 「小爱原本的回答 + MiniMax 的回答并列两段」。起泵后小爱的 ToastStream
+                    // 在 hookBridge 里被滤掉,我们的答案注入时占据的就是原本的回答位置。
+                    if (config.speakAnswer) startMutePump(dialogId)
+                    session(dialogId).pendingViewAnswer = true
+                    Log.i(TAG, "general takeover (pump on): $queryText")
+
                     // 按「一次问话」归拢:同一句话小爱可能派发多个 dialogId,不能各调各的模型
                     val key = utteranceKeyFor(queryText)
                     utteranceDialogs.getOrPut(key) { ConcurrentHashMap.newKeySet() }.add(dialogId)
@@ -1789,10 +1869,12 @@ class HookEntry : IXposedHookLoadPackage {
                     if (type == "instruction" && !takenOverNow && isMutePumpActive()) {
                         val filtered = filterOutToastStream(content)
                         if (filtered == null) {
+                            hookStatus("bridge suppress xiaoai ToastStream dialogId=$dialogId")
                             Log.i(TAG, "suppress xiaoai ToastStream (pump active, dialogId=$dialogId not-yet-takeover)")
                             param.result = null
                             return
                         } else if (filtered != content) {
+                            hookStatus("bridge stripped xiaoai ToastStream dialogId=$dialogId")
                             Log.i(TAG, "stripped xiaoai ToastStream (pump active) dialogId=$dialogId")
                             param.args[1] = filtered
                         }

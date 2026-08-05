@@ -830,6 +830,10 @@ object AiClient {
         // 闭合标签缺失(截断/流式没收尾)时上面的成对匹配会漏,这里把残留的开标签及其后内容也切掉
         s = s.replace(Regex("<tool_call>.*", RegexOption.DOT_MATCHES_ALL), "")
         s = s.replace(Regex("</?(tool_call|tool_response|arguments|parameter|name)[^>]*>"), "")
+        // 思维链(MiniMax 等模型的 <think> 标签)不是给用户看的,整段剥掉。
+        // 成对剥掉;未闭合的(流式截断)从开标签一路切到尾。
+        s = s.replace(Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL), "")
+        s = s.replace(Regex("<think>.*", RegexOption.DOT_MATCHES_ALL), "")
         return s.trim()
     }
 }
