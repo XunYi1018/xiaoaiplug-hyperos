@@ -27,7 +27,7 @@ import java.util.concurrent.TimeUnit
 object AiClient {
 
     private const val TAG = "XiaoAiProbe"
-    private const val MAX_TOOL_ITERATIONS = 6
+    private const val MAX_TOOL_ITERATIONS = 12
 
     private const val ANTHROPIC_VERSION = "2023-06-01"
     // Anthropic 必填。语音助手的答案都很短,4096 够用还留了工具循环的余量。
